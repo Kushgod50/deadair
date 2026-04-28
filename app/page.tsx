@@ -1,5 +1,7 @@
 'use client'
-import { useState } from 'react'
+import { useState, useRef } from 'react'
+
+const WORKER_URL = process.env.NEXT_PUBLIC_WORKER_URL || 'http://localhost:3001'
 
 const COLORS: Record<string, string> = {
   silence: '#FF6B6B', afk: '#FFB347', filler: '#9146FF',
@@ -39,12 +41,17 @@ export default function Page() {
   const [result, setResult] = useState<any>(null)
   const [tab, setTab] = useState('cuts')
 
+  // Processing state
+  const [processing, setProcessing] = useState(false)
+  const [processJob, setProcessJob] = useState<any>(null)
+  const pollRef = useRef<any>(null)
+
   async function submit(e: any) {
     e.preventDefault()
     if (!url || loading) return
-    setLoading(true); setError(''); setResult(null)
+    setLoading(true); setError(''); setResult(null); setProcessJob(null)
     try {
-      const r = await fetch('/api/analyze', {
+      const r = await fetch(`${WORKER_URL}/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, description: notes, aggressiveness: agg, censorEnabled }),
@@ -60,13 +67,52 @@ export default function Page() {
     }
   }
 
+  async function startProcessing() {
+    if (!result || processing) return
+    setProcessing(true)
+    setProcessJob({ status: 'queued', phase: 'Starting...', progress: 0 })
+    try {
+      const r = await fetch(`${WORKER_URL}/api/process`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          cuts: result.cuts,
+          muteWords: result.muteWords || [],
+          vodTitle: result.vodTitle,
+        }),
+      })
+      const d = await r.json()
+      if (!r.ok) throw new Error(d.error)
+
+      // Poll status
+      pollRef.current = setInterval(async () => {
+        const s = await fetch(`${WORKER_URL}/api/status/${d.jobId}`)
+        const job = await s.json()
+        setProcessJob({ ...job, jobId: d.jobId })
+        if (job.status === 'done' || job.status === 'error') {
+          clearInterval(pollRef.current)
+          setProcessing(false)
+        }
+      }, 2000)
+    } catch (e: any) {
+      setError(e.message)
+      setProcessing(false)
+    }
+  }
+
   const safe = (s: string) => s.replace(/[^a-z0-9]/gi, '_').toLowerCase()
   const hasMutes = result?.muteWords?.length > 0
+  const jobDone = processJob?.status === 'done'
+  const jobError = processJob?.status === 'error'
+
+  const PHASE_ICONS: Record<string, string> = {
+    downloading: '⬇', trimming: '✂', merging: '🔗',
+    censoring: '🔇', finalizing: '✨', done: '✅', error: '⚠',
+  }
 
   return (
     <main style={{ minHeight: '100vh', padding: '0 0 80px' }}>
-
-      {/* Nav */}
       <div style={{ borderBottom: '1px solid #1a1a1a', padding: '14px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{ width: 28, height: 28, background: '#9146FF', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 }}>✂</div>
@@ -77,15 +123,13 @@ export default function Page() {
 
       <div style={{ maxWidth: 660, margin: '0 auto', padding: '40px 20px 0' }}>
 
-        {/* Hero */}
         {!result && !loading && (
           <div style={{ textAlign: 'center', marginBottom: 40 }}>
             <h1 style={{ fontFamily: 'Bebas Neue, sans-serif', fontSize: 'clamp(52px,12vw,90px)', letterSpacing: '0.04em', lineHeight: 1, margin: '0 0 12px' }}>
               CUT THE<br /><span style={{ color: '#9146FF' }}>DEAD AIR</span>
             </h1>
             <p style={{ color: '#555', fontSize: 14, lineHeight: 1.7, maxWidth: 420, margin: '0 auto' }}>
-              Paste a Twitch VOD URL. Claude finds the silence, AFK time, and slow moments.
-              Download a cut list for Premiere or DaVinci — no uploads, no re-encoding.
+              Paste a Twitch VOD URL. Claude finds the dead time. Download a trimmed MP4 with chapter markers — ready for upload or editing.
             </p>
           </div>
         )}
@@ -93,27 +137,23 @@ export default function Page() {
         {/* Form */}
         <form onSubmit={submit} style={{ marginBottom: 28 }}>
           <div style={{ ...S.card, display: 'flex', flexDirection: 'column', gap: 16 }}>
-
             <div>
               <label style={S.label}>Twitch VOD URL</label>
               <input type="url" value={url} onChange={e => setUrl(e.target.value)}
                 placeholder="https://www.twitch.tv/videos/123456789"
-                disabled={loading} required style={S.input} />
+                disabled={loading || processing} required style={S.input} />
             </div>
-
             <div>
               <label style={S.label}>Notes (optional)</label>
               <input type="text" value={notes} onChange={e => setNotes(e.target.value)}
-                placeholder="e.g. Minecraft stream, ~4 hours, lots of building"
-                disabled={loading} style={S.input} />
+                placeholder="e.g. Minecraft stream, ~4 hours"
+                disabled={loading || processing} style={S.input} />
             </div>
-
-            {/* Aggressiveness */}
             <div>
               <label style={S.label}>Cut aggressiveness</label>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
                 {['conservative','moderate','aggressive'].map(o => (
-                  <button key={o} type="button" onClick={() => setAgg(o)}
+                  <button key={o} type="button" onClick={() => setAgg(o)} disabled={loading || processing}
                     style={{ background: agg===o ? 'rgba(145,70,255,0.12)' : 'transparent', border: `1px solid ${agg===o ? '#9146FF' : '#242424'}`, borderRadius: 6, padding: '8px 4px', color: agg===o ? '#9146FF' : '#555', fontFamily: 'Space Mono, monospace', fontSize: 11, cursor: 'pointer', textTransform: 'capitalize' }}>
                     {o}
                   </button>
@@ -127,32 +167,24 @@ export default function Page() {
             </div>
 
             {/* Censor toggle */}
-            <div
-              onClick={() => setCensorEnabled(v => !v)}
+            <div onClick={() => !loading && !processing && setCensorEnabled(v => !v)}
               style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', background: censorEnabled ? 'rgba(255,107,107,0.06)' : '#0C0C0C', border: `1px solid ${censorEnabled ? 'rgba(255,107,107,0.3)' : '#242424'}`, borderRadius: 8, cursor: 'pointer', userSelect: 'none' }}>
               <div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: censorEnabled ? '#FF6B6B' : '#888', fontFamily: 'Space Mono, monospace' }}>
-                  🔇 Mute profanity &amp; slurs
-                </div>
-                <div style={{ fontSize: 11, color: '#444', marginTop: 3 }}>
-                  Claude flags curse words — FFmpeg script mutes them with silence
-                </div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: censorEnabled ? '#FF6B6B' : '#888', fontFamily: 'Space Mono, monospace' }}>🔇 Mute profanity &amp; slurs</div>
+                <div style={{ fontSize: 11, color: '#444', marginTop: 3 }}>Claude flags curse words — silenced in the output MP4</div>
               </div>
-              {/* Toggle pill */}
               <div style={{ width: 42, height: 24, borderRadius: 12, background: censorEnabled ? '#FF6B6B' : '#242424', position: 'relative', flexShrink: 0, transition: 'background 0.2s' }}>
                 <div style={{ position: 'absolute', top: 3, left: censorEnabled ? 21 : 3, width: 18, height: 18, borderRadius: '50%', background: 'white', transition: 'left 0.2s' }} />
               </div>
             </div>
 
             {error && (
-              <div style={{ padding: '10px 14px', background: 'rgba(255,68,68,0.08)', border: '1px solid rgba(255,68,68,0.2)', borderRadius: 6, fontSize: 13, color: '#FF6B6B' }}>
-                ⚠ {error}
-              </div>
+              <div style={{ padding: '10px 14px', background: 'rgba(255,68,68,0.08)', border: '1px solid rgba(255,68,68,0.2)', borderRadius: 6, fontSize: 13, color: '#FF6B6B' }}>⚠ {error}</div>
             )}
 
-            <button type="submit" disabled={loading || !url}
-              style={{ background: loading || !url ? '#1a1a1a' : '#9146FF', color: loading || !url ? '#444' : 'white', border: 'none', borderRadius: 7, padding: '12px 20px', fontFamily: 'Space Mono, monospace', fontWeight: 700, fontSize: 13, cursor: loading || !url ? 'not-allowed' : 'pointer' }}>
-              {loading ? 'Analyzing...' : result ? 'Analyze again →' : 'Analyze VOD →'}
+            <button type="submit" disabled={loading || processing || !url}
+              style={{ background: loading || processing || !url ? '#1a1a1a' : '#9146FF', color: loading || processing || !url ? '#444' : 'white', border: 'none', borderRadius: 7, padding: '12px 20px', fontFamily: 'Space Mono, monospace', fontWeight: 700, fontSize: 13, cursor: loading || processing || !url ? 'not-allowed' : 'pointer' }}>
+              {loading ? 'Analyzing...' : result ? 'Re-analyze →' : 'Analyze VOD →'}
             </button>
           </div>
         </form>
@@ -161,10 +193,7 @@ export default function Page() {
         {loading && (
           <div style={{ ...S.card, textAlign: 'center', padding: '32px 20px' }}>
             <div style={{ fontSize: 28, marginBottom: 12, animation: 'spin 1s linear infinite', display: 'inline-block' }}>◌</div>
-            <div style={{ fontSize: 13, color: '#9146FF' }}>
-              {censorEnabled ? 'Scanning for dead air and profanity...' : 'Claude is scanning for dead air...'}
-            </div>
-            <div style={{ fontSize: 11, color: '#333', marginTop: 4 }}>This takes ~10–20 seconds</div>
+            <div style={{ fontSize: 13, color: '#9146FF' }}>Claude is scanning for dead air...</div>
             <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
           </div>
         )}
@@ -206,13 +235,12 @@ export default function Page() {
 
             {/* Timeline */}
             <div style={{ ...S.card, padding: '14px 16px' }}>
-              <span style={S.label}>VOD Timeline — hover a segment for details</span>
+              <span style={S.label}>VOD Timeline</span>
               <div style={{ height: 28, background: '#1E3A2E', borderRadius: 4, position: 'relative', overflow: 'hidden', border: '1px solid #1a1a1a' }}>
                 {result.cuts.map((c: any, i: number) => (
                   <div key={i} title={`${c.start}→${c.end}: ${c.reason}`}
                     style={{ position: 'absolute', top: 0, bottom: 0, left: `${(c.startSeconds/result.totalDurationSeconds)*100}%`, width: `${Math.max(((c.endSeconds-c.startSeconds)/result.totalDurationSeconds)*100, 0.3)}%`, background: COLORS[c.type]||'#9146FF', opacity: 0.75, cursor: 'pointer' }} />
                 ))}
-                {/* Mute word markers */}
                 {result.muteWords?.map((w: any, i: number) => (
                   <div key={`m${i}`} title={`Muted at ${w.timestamp}`}
                     style={{ position: 'absolute', top: 0, bottom: 0, width: 3, left: `${(w.startSeconds/result.totalDurationSeconds)*100}%`, background: '#FF6B6B', zIndex: 2 }} />
@@ -227,11 +255,6 @@ export default function Page() {
                     <span style={{ width: 10, height: 10, background: v, display: 'inline-block', borderRadius: 2 }}/>{k}
                   </span>
                 ))}
-                {hasMutes && (
-                  <span style={{ fontSize: 11, color: '#555', display: 'flex', alignItems: 'center', gap: 4 }}>
-                    <span style={{ width: 3, height: 10, background: '#FF6B6B', display: 'inline-block' }}/>muted word
-                  </span>
-                )}
               </div>
             </div>
 
@@ -249,7 +272,7 @@ export default function Page() {
                   </button>
                 ))}
               </div>
-              <div style={{ maxHeight: 300, overflowY: 'auto', padding: 14 }}>
+              <div style={{ maxHeight: 280, overflowY: 'auto', padding: 14 }}>
                 {tab === 'cuts' && result.cuts.map((c: any, i: number) => (
                   <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px', background: '#0C0C0C', borderRadius: 5, marginBottom: 6, borderLeft: `3px solid ${COLORS[c.type]||'#9146FF'}` }}>
                     <span style={{ fontSize: 10, color: COLORS[c.type], fontWeight: 700, minWidth: 75, textTransform: 'uppercase' }}>{c.type}</span>
@@ -275,34 +298,123 @@ export default function Page() {
               </div>
             </div>
 
-            {/* Downloads */}
-            <div style={{ ...S.card, padding: '14px 16px' }}>
-              <span style={S.label}>Download cut files</span>
-              <div style={{ display: 'grid', gridTemplateColumns: hasMutes ? 'repeat(4,1fr)' : 'repeat(3,1fr)', gap: 10 }}>
+            {/* ── DOWNLOAD MP4 SECTION ── */}
+            <div style={{ ...S.card, padding: '20px' }}>
+              <span style={S.label}>Get trimmed MP4</span>
+
+              {!processJob && (
+                <>
+                  <div style={{ fontSize: 13, color: '#888', marginBottom: 14, lineHeight: 1.7 }}>
+                    Click below to download the actual trimmed video. The worker will download your VOD, cut the dead segments, {hasMutes ? 'mute flagged words, ' : ''}and add chapter markers — then hand you the MP4.
+                  </div>
+                  <div style={{ fontSize: 11, color: '#444', marginBottom: 14, padding: '8px 12px', background: '#0C0C0C', borderRadius: 6 }}>
+                    ⏱ Estimated time: ~{Math.max(2, Math.round(result.totalDurationSeconds / 300))}–{Math.max(5, Math.round(result.totalDurationSeconds / 120))} min depending on VOD size
+                  </div>
+                  <button onClick={startProcessing}
+                    style={{ background: '#9146FF', color: 'white', border: 'none', borderRadius: 7, padding: '12px 20px', fontFamily: 'Space Mono, monospace', fontWeight: 700, fontSize: 13, cursor: 'pointer', width: '100%' }}>
+                    ⬇ Generate &amp; Download MP4
+                  </button>
+                </>
+              )}
+
+              {processJob && !jobDone && !jobError && (
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                    <span style={{ fontSize: 20 }}>{PHASE_ICONS[processJob.status] || '⚙'}</span>
+                    <span style={{ fontSize: 13, color: '#ccc' }}>{processJob.phase}</span>
+                    <span style={{ marginLeft: 'auto', fontSize: 12, color: '#9146FF', fontFamily: 'Space Mono, monospace' }}>{processJob.progress}%</span>
+                  </div>
+                  <div style={{ height: 6, background: '#0C0C0C', borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', background: 'linear-gradient(90deg,#7C3AED,#9146FF)', borderRadius: 3, width: `${processJob.progress}%`, transition: 'width 0.5s' }} />
+                  </div>
+                  <div style={{ fontSize: 11, color: '#444', marginTop: 8 }}>
+                    {processJob.status === 'downloading' && 'Downloading VOD from Twitch — this is the slowest step for long streams'}
+                    {processJob.status === 'trimming' && 'Cutting segments with FFmpeg stream copy — no re-encoding, very fast'}
+                    {processJob.status === 'merging' && 'Stitching segments together'}
+                    {processJob.status === 'censoring' && 'Muting flagged words in audio track'}
+                    {processJob.status === 'finalizing' && 'Embedding chapter markers into MP4'}
+                  </div>
+                </div>
+              )}
+
+              {jobDone && (
+                <div>
+                  <div style={{ fontSize: 13, color: '#39D353', marginBottom: 14 }}>✅ Your trimmed MP4 is ready!</div>
+                  <a href={`${WORKER_URL}/api/download/${processJob.jobId}`} download
+                    style={{ display: 'block', background: '#39D353', color: '#0C0C0C', border: 'none', borderRadius: 7, padding: '12px 20px', fontFamily: 'Space Mono, monospace', fontWeight: 700, fontSize: 13, cursor: 'pointer', width: '100%', textAlign: 'center', textDecoration: 'none', boxSizing: 'border-box' }}>
+                    ⬇ Download {safe(result.vodTitle)}_trimmed.mp4
+                  </a>
+                  <div style={{ fontSize: 11, color: '#444', marginTop: 8 }}>
+                    File will be deleted from the server after download.
+                  </div>
+                </div>
+              )}
+
+              {jobError && (
+                <div style={{ padding: '10px 14px', background: 'rgba(255,68,68,0.08)', border: '1px solid rgba(255,68,68,0.2)', borderRadius: 6, fontSize: 13, color: '#FF6B6B' }}>
+                  ⚠ {processJob.error || 'Processing failed. Try again.'}
+                  <button onClick={() => { setProcessJob(null); setProcessing(false) }}
+                    style={{ display: 'block', marginTop: 8, background: 'transparent', border: '1px solid #FF6B6B', color: '#FF6B6B', borderRadius: 5, padding: '6px 12px', fontFamily: 'Space Mono, monospace', fontSize: 11, cursor: 'pointer' }}>
+                    Try again
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Text file downloads still available */}
+            <details style={{ ...S.card, padding: '14px 16px' }}>
+              <summary style={{ cursor: 'pointer', fontSize: 12, color: '#555', fontFamily: 'Space Mono, monospace', userSelect: 'none' }}>
+                Also available: EDL / Chapter text files
+              </summary>
+              <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                 {[
-                  { label: 'EDL File', desc: 'Premiere / DaVinci', ext: 'edl', content: result.edlContent, icon: '🎬' },
-                  { label: 'Chapters', desc: 'YouTube / text', ext: 'txt', content: result.chaptersTxt, icon: '📍' },
-                  { label: 'Trim + Mute', desc: 'FFmpeg — all-in-one', ext: 'sh', content: result.ffmpegScript, icon: '⚡' },
-                  ...(hasMutes && result.muteScript ? [{ label: 'Mute Only', desc: 'Apply to trimmed file', ext: 'sh', content: result.muteScript, icon: '🔇' }] : []),
+                  { label: 'EDL File', desc: 'Premiere / DaVinci', ext: 'edl', content: buildEDL(result.cuts, result.vodTitle, result.totalDurationSeconds), icon: '🎬' },
+                  { label: 'Chapters', desc: 'YouTube / text', ext: 'txt', content: buildChaptersTxt(result.chapters, result.cuts), icon: '📍' },
                 ].map((d, i) => (
-                  <button key={i} onClick={() => dl(`${safe(result.vodTitle)}_${d.ext}${i === 3 ? '_mute' : ''}.${d.ext}`, d.content)}
+                  <button key={i} onClick={() => dl(`${safe(result.vodTitle)}.${d.ext}`, d.content)}
                     style={{ background: 'transparent', border: '1px solid #242424', borderRadius: 7, padding: 12, textAlign: 'left', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <span style={{ fontSize: 18 }}>{d.icon}</span>
+                    <span style={{ fontSize: 16 }}>{d.icon}</span>
                     <span style={{ fontSize: 12, fontWeight: 700, color: '#ddd', fontFamily: 'Space Mono, monospace' }}>{d.label}</span>
                     <span style={{ fontSize: 10, color: '#555', fontFamily: 'Space Mono, monospace' }}>{d.desc}</span>
                   </button>
                 ))}
               </div>
-              <div style={{ marginTop: 12, padding: '10px 14px', background: '#0C0C0C', borderRadius: 6, fontSize: 11, color: '#444', lineHeight: 1.8 }}>
-                <b style={{ color: '#666' }}>EDL:</b> File → Import → EDL in Premiere or DaVinci. Uses your original VOD, no re-encoding.{'  '}
-                <b style={{ color: '#666' }}>Trim + Mute script:</b> <code style={{ color: '#9146FF' }}>bash trim.sh vod.mp4</code> — cuts dead time and mutes flagged words in one pass.{'  '}
-                {hasMutes && <><b style={{ color: '#666' }}>Mute Only:</b> Run on an already-trimmed file if you used the EDL in your editor.</>}
-              </div>
-            </div>
+            </details>
 
           </div>
         )}
       </div>
     </main>
   )
+}
+
+// Client-side EDL/chapters builders for the text download fallback
+function toTC(s: number) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60)
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+}
+function toTC_EDL(s: number) { return toTC(s) + ':00' }
+function buildEDL(cuts: any[], title: string, total: number) {
+  const sorted = [...cuts].sort((a, b) => a.startSeconds - b.startSeconds)
+  const keep: {start:number,end:number}[] = []
+  let cur = 0
+  for (const c of sorted) { if (c.startSeconds > cur+1) keep.push({start:cur,end:c.startSeconds}); cur = c.endSeconds }
+  if (cur < total-1) keep.push({start:cur,end:total})
+  const lines = [`TITLE: ${title}`, 'FCM: NON-DROP FRAME', '']
+  let rec = 0
+  keep.forEach((seg, i) => {
+    const dur = seg.end - seg.start
+    lines.push(`${String(i+1).padStart(3,'0')}  AX       V     C        ${toTC_EDL(seg.start)} ${toTC_EDL(seg.end)} ${toTC_EDL(rec)} ${toTC_EDL(rec+dur)}`)
+    lines.push(`* FROM CLIP NAME: ${title}`); lines.push(''); rec += dur
+  })
+  return lines.join('\n')
+}
+function buildChaptersTxt(chapters: any[], cuts: any[]) {
+  const lines = ['CHAPTERS\n']
+  for (const ch of chapters) {
+    let offset = 0
+    for (const c of cuts) { if (c.endSeconds <= ch.seconds) offset += c.endSeconds - c.startSeconds; else if (c.startSeconds < ch.seconds) { offset += ch.seconds - c.startSeconds; break } }
+    lines.push(`${toTC(Math.max(0, ch.seconds - offset))}  ${ch.title}`)
+  }
+  return lines.join('\n')
 }
